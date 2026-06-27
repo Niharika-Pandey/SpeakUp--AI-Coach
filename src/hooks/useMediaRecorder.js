@@ -13,57 +13,78 @@ export function useMediaRecorder() {
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [permState, setPermState] = useState('idle'); // idle | requesting | granted | denied
 
-  // Step 1: just get the camera stream and attach to video element (no recording yet)
-  const requestCamera = useCallback(async (videoElement) => {
+  // Step 1: get the camera stream ONLY — do NOT attach to a video element here.
+  // Video attachment happens in the component after the element is visible and in DOM.
+  const requestCamera = useCallback(async () => {
     setError(null);
     setPermState('requesting');
 
-    try {
-      // Try ideal constraints first, fall back to basic
-      let stream;
+    let stream = null;
+
+    // Strategy: try progressively simpler constraints so mobile doesn't fail
+    const attempts = [
+      // Attempt 1: prefer front camera, basic audio
+      () => navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: 'user' } },
+        audio: true,
+      }),
+      // Attempt 2: bare minimum — let browser decide everything
+      () => navigator.mediaDevices.getUserMedia({ video: true, audio: true }),
+    ];
+
+    let lastErr = null;
+    for (const attempt of attempts) {
       try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
-          audio: { echoCancellation: true, noiseSuppression: true },
-        });
-      } catch {
-        // Fall back to minimal constraints
-        stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        stream = await attempt();
+        break; // success
+      } catch (err) {
+        lastErr = err;
+        // Only retry if it's NOT a hard permission denial
+        if (err.name === 'NotAllowedError') break;
       }
+    }
 
-      streamRef.current = stream;
-
-      if (videoElement) {
-        videoElement.srcObject = stream;
-        videoElement.muted = true;
-        try {
-          await videoElement.play();
-        } catch {
-          // play() might auto-resolve on some browsers
-        }
+    if (!stream) {
+      const err = lastErr;
+      let msg;
+      if (err?.name === 'NotAllowedError') {
+        msg = 'Camera permission denied. Tap the camera/lock icon in your browser address bar, set Camera & Microphone to Allow, then try again.';
+      } else if (err?.name === 'NotFoundError') {
+        msg = 'No camera found on this device.';
+      } else if (err?.name === 'NotReadableError') {
+        msg = 'Camera is in use by another app. Close other apps using the camera and try again.';
+      } else {
+        msg = err?.message || 'Could not access camera.';
       }
-
-      setPermState('granted');
-      return stream;
-    } catch (err) {
-      const msg =
-        err.name === 'NotAllowedError'
-          ? 'Camera permission denied. Click the camera icon in your browser address bar and allow access.'
-          : err.name === 'NotFoundError'
-          ? 'No camera found. Please connect a camera and try again.'
-          : err.name === 'NotReadableError'
-          ? 'Camera is already in use by another app. Close other apps using the camera.'
-          : err.message || 'Could not access camera.';
       setError(msg);
       setPermState('denied');
-      throw err;
+      throw new Error(msg);
+    }
+
+    streamRef.current = stream;
+    setPermState('granted');
+    return stream;
+  }, []);
+
+  // Step 2: attach stream to a video element that is now visible in the DOM
+  const attachToVideo = useCallback((videoElement) => {
+    if (!streamRef.current || !videoElement) return;
+    videoElement.srcObject = streamRef.current;
+    videoElement.muted = true;
+    // play() may fail on some mobile browsers — that's OK, autoplay attr handles it
+    const playPromise = videoElement.play();
+    if (playPromise !== undefined) {
+      playPromise.catch(() => {
+        // Autoplay blocked — user will need to tap the video to start it
+        // Usually fine since we show the video preview
+      });
     }
   }, []);
 
-  // Step 2: start recording (stream already open)
+  // Step 3: start recording (stream already open)
   const startRecording = useCallback(() => {
     if (!streamRef.current) {
-      setError('No camera stream. Please allow camera access first.');
+      setError('No camera stream available.');
       return;
     }
 
@@ -77,8 +98,9 @@ export function useMediaRecorder() {
       'video/webm;codecs=vp8,opus',
       'video/webm',
       'video/mp4',
+      '',
     ];
-    const mimeType = mimeTypes.find(t => MediaRecorder.isTypeSupported(t)) || '';
+    const mimeType = mimeTypes.find(t => t === '' || MediaRecorder.isTypeSupported(t));
 
     try {
       const recorder = new MediaRecorder(
@@ -98,12 +120,10 @@ export function useMediaRecorder() {
         setVideoUrl(url);
       };
 
-      recorder.start(250);
+      recorder.start(500);
       setIsRecording(true);
 
-      timerRef.current = setInterval(() => {
-        setElapsedSeconds(s => s + 1);
-      }, 1000);
+      timerRef.current = setInterval(() => setElapsedSeconds(s => s + 1), 1000);
     } catch (err) {
       setError('Failed to start recording: ' + err.message);
     }
@@ -128,6 +148,7 @@ export function useMediaRecorder() {
 
   return {
     requestCamera,
+    attachToVideo,
     startRecording,
     stopRecording,
     stopCamera,
