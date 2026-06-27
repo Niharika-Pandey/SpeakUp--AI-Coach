@@ -11,50 +11,56 @@ export function useMediaRecorder() {
   const [videoUrl, setVideoUrl] = useState(null);
   const [error, setError] = useState(null);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
-  const [permState, setPermState] = useState('idle'); // idle | requesting | granted | denied
+  const [permState, setPermState] = useState('idle');
 
-  // Step 1: get the camera stream ONLY — do NOT attach to a video element here.
-  // Video attachment happens in the component after the element is visible and in DOM.
-  const requestCamera = useCallback(async () => {
+  const requestCamera = useCallback(async (videoElement) => {
     setError(null);
     setPermState('requesting');
 
-    let stream = null;
-
-    // Strategy: try progressively simpler constraints so mobile doesn't fail
+    // Try constraints from most specific to most permissive
     const attempts = [
-      // Attempt 1: prefer front camera, basic audio
-      () => navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: 'user' } },
-        audio: true,
-      }),
-      // Attempt 2: bare minimum — let browser decide everything
-      () => navigator.mediaDevices.getUserMedia({ video: true, audio: true }),
+      { video: { facingMode: 'user' }, audio: true },
+      { video: { facingMode: 'environment' }, audio: true },
+      { video: true, audio: true },
+      { video: true },
     ];
 
+    let stream = null;
     let lastErr = null;
-    for (const attempt of attempts) {
+
+    for (const constraints of attempts) {
       try {
-        stream = await attempt();
-        break; // success
+        stream = await navigator.mediaDevices.getUserMedia(constraints);
+        break;
       } catch (err) {
         lastErr = err;
-        // Only retry if it's NOT a hard permission denial
-        if (err.name === 'NotAllowedError') break;
+        // Hard stop on permission denial — no point retrying
+        if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') break;
+        // Otherwise try next simpler constraint set
       }
     }
 
     if (!stream) {
-      const err = lastErr;
       let msg;
-      if (err?.name === 'NotAllowedError') {
-        msg = 'Camera permission denied. Tap the camera/lock icon in your browser address bar, set Camera & Microphone to Allow, then try again.';
-      } else if (err?.name === 'NotFoundError') {
+      const n = lastErr?.name || '';
+      if (n === 'NotAllowedError' || n === 'PermissionDeniedError') {
+        const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent);
+        const isAndroid = /android/i.test(navigator.userAgent);
+        if (isIOS) {
+          msg = 'Permission denied on iPhone/iPad. Go to Settings → Safari → Camera & Microphone → set to Allow. Then reload this page.';
+        } else if (isAndroid) {
+          msg = 'Permission denied. Tap the lock icon in your browser address bar → Permissions → allow Camera and Microphone. Then try again.';
+        } else {
+          msg = 'Camera access denied. Click the camera icon in the address bar and set to Allow.';
+        }
+      } else if (n === 'NotFoundError' || n === 'DevicesNotFoundError') {
         msg = 'No camera found on this device.';
-      } else if (err?.name === 'NotReadableError') {
+      } else if (n === 'NotReadableError' || n === 'TrackStartError') {
         msg = 'Camera is in use by another app. Close other apps using the camera and try again.';
+      } else if (n === 'OverconstrainedError') {
+        msg = 'Camera does not support required settings. Try a different browser.';
       } else {
-        msg = err?.message || 'Could not access camera.';
+        msg = (lastErr?.message || 'Could not access camera.') + ' (Try Chrome or Safari on mobile.)';
       }
       setError(msg);
       setPermState('denied');
@@ -62,67 +68,50 @@ export function useMediaRecorder() {
     }
 
     streamRef.current = stream;
+
+    // Attach to video element immediately while we still have the reference
+    if (videoElement) {
+      try {
+        videoElement.srcObject = stream;
+        // Must set muted as property (React prop alone doesn't always work on iOS)
+        videoElement.muted = true;
+        videoElement.setAttribute('playsinline', '');
+        videoElement.setAttribute('webkit-playsinline', '');
+        await videoElement.play();
+      } catch (playErr) {
+        // play() failure is non-fatal — autoPlay attribute handles it on most browsers
+        console.warn('video.play() failed:', playErr.message);
+      }
+    }
+
     setPermState('granted');
     return stream;
   }, []);
 
-  // Step 2: attach stream to a video element that is now visible in the DOM
-  const attachToVideo = useCallback((videoElement) => {
-    if (!streamRef.current || !videoElement) return;
-    videoElement.srcObject = streamRef.current;
-    videoElement.muted = true;
-    // play() may fail on some mobile browsers — that's OK, autoplay attr handles it
-    const playPromise = videoElement.play();
-    if (playPromise !== undefined) {
-      playPromise.catch(() => {
-        // Autoplay blocked — user will need to tap the video to start it
-        // Usually fine since we show the video preview
-      });
-    }
-  }, []);
-
-  // Step 3: start recording (stream already open)
   const startRecording = useCallback(() => {
-    if (!streamRef.current) {
-      setError('No camera stream available.');
-      return;
-    }
+    if (!streamRef.current) { setError('No camera stream available.'); return; }
 
     chunksRef.current = [];
     setVideoBlob(null);
     setVideoUrl(null);
     setElapsedSeconds(0);
 
-    const mimeTypes = [
-      'video/webm;codecs=vp9,opus',
-      'video/webm;codecs=vp8,opus',
-      'video/webm',
-      'video/mp4',
-      '',
-    ];
+    const mimeTypes = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm', 'video/mp4', ''];
     const mimeType = mimeTypes.find(t => t === '' || MediaRecorder.isTypeSupported(t));
 
     try {
-      const recorder = new MediaRecorder(
-        streamRef.current,
-        mimeType ? { mimeType } : {}
-      );
+      const recorder = new MediaRecorder(streamRef.current, mimeType ? { mimeType } : {});
       mediaRecorderRef.current = recorder;
 
-      recorder.ondataavailable = e => {
-        if (e.data && e.data.size > 0) chunksRef.current.push(e.data);
-      };
-
+      recorder.ondataavailable = e => { if (e.data?.size > 0) chunksRef.current.push(e.data); };
       recorder.onstop = () => {
         const blob = new Blob(chunksRef.current, { type: mimeType || 'video/webm' });
-        const url = URL.createObjectURL(blob);
         setVideoBlob(blob);
-        setVideoUrl(url);
+        setVideoUrl(URL.createObjectURL(blob));
       };
 
       recorder.start(500);
       setIsRecording(true);
-
       timerRef.current = setInterval(() => setElapsedSeconds(s => s + 1), 1000);
     } catch (err) {
       setError('Failed to start recording: ' + err.message);
@@ -131,32 +120,19 @@ export function useMediaRecorder() {
 
   const stopRecording = useCallback(() => {
     if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      mediaRecorderRef.current.stop();
-    }
+    if (mediaRecorderRef.current?.state !== 'inactive') mediaRecorderRef.current?.stop();
     setIsRecording(false);
   }, []);
 
   const stopCamera = useCallback(() => {
     stopRecording();
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(t => t.stop());
-      streamRef.current = null;
-    }
+    streamRef.current?.getTracks().forEach(t => t.stop());
+    streamRef.current = null;
     setPermState('idle');
   }, [stopRecording]);
 
   return {
-    requestCamera,
-    attachToVideo,
-    startRecording,
-    stopRecording,
-    stopCamera,
-    isRecording,
-    videoBlob,
-    videoUrl,
-    error,
-    elapsedSeconds,
-    permState,
+    requestCamera, startRecording, stopRecording, stopCamera,
+    isRecording, videoBlob, videoUrl, error, elapsedSeconds, permState,
   };
 }
